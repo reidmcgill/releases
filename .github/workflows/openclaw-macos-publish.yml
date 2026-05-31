@@ -41,7 +41,7 @@ on:
         type: string
 
 concurrency:
-  group: openclaw-macos-publish-${{ contains(inputs.tag, '-beta.') && inputs.tag || 'stable-feed' }}
+  group: openclaw-macos-publish-${{ contains(inputs.tag, '-beta.') && 'beta-feed' || 'stable-feed' }}
   cancel-in-progress: false
 
 env:
@@ -49,7 +49,8 @@ env:
   NODE_VERSION: "24.x"
   PNPM_VERSION: "10.23.0"
   OPENCLAW_REPOSITORY: openclaw/openclaw
-  SPARKLE_FEED_URL: https://raw.githubusercontent.com/openclaw/openclaw/main/appcast.xml
+  SPARKLE_STABLE_FEED_URL: https://raw.githubusercontent.com/openclaw/openclaw/main/appcast.xml
+  SPARKLE_BETA_FEED_URL: https://raw.githubusercontent.com/openclaw/openclaw/main/appcast-beta.xml
 
 jobs:
   prepare:
@@ -229,8 +230,12 @@ jobs:
           set -euo pipefail
           if [[ "$RELEASE_TAG" == *-beta.* ]]; then
             echo "is_beta=true" >> "$GITHUB_OUTPUT"
+            echo "feed_url=${SPARKLE_BETA_FEED_URL}" >> "$GITHUB_OUTPUT"
+            echo "appcast_file=appcast-beta.xml" >> "$GITHUB_OUTPUT"
           else
             echo "is_beta=false" >> "$GITHUB_OUTPUT"
+            echo "feed_url=${SPARKLE_STABLE_FEED_URL}" >> "$GITHUB_OUTPUT"
+            echo "appcast_file=appcast.xml" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Release packaging guards
@@ -322,7 +327,7 @@ jobs:
           SKIP_PNPM_INSTALL: "1"
           SKIP_TSC: "1"
           SKIP_UI_BUILD: "1"
-          SPARKLE_FEED_URL: ${{ env.SPARKLE_FEED_URL }}
+          SPARKLE_FEED_URL: ${{ steps.release_channel.outputs.feed_url }}
         run: scripts/package-mac-dist.sh
 
       - name: Import Developer ID certificate
@@ -410,27 +415,51 @@ jobs:
           SKIP_PNPM_INSTALL: "1"
           SKIP_TSC: "1"
           SKIP_UI_BUILD: "1"
-          SPARKLE_FEED_URL: ${{ env.SPARKLE_FEED_URL }}
+          SPARKLE_FEED_URL: ${{ steps.release_channel.outputs.feed_url }}
         run: scripts/package-mac-dist.sh
 
       - name: Seed appcast from public main
-        if: ${{ !inputs.smoke_test_only && steps.release_channel.outputs.is_beta != 'true' }}
+        if: ${{ !inputs.smoke_test_only }}
+        env:
+          APPCAST_FILE: ${{ steps.release_channel.outputs.appcast_file }}
+          SPARKLE_FEED_URL: ${{ steps.release_channel.outputs.feed_url }}
         run: |
           set -euo pipefail
-          if curl -fsSL "$SPARKLE_FEED_URL" -o source/appcast.xml; then
+          if curl -fsSL "$SPARKLE_FEED_URL" -o "source/${APPCAST_FILE}"; then
             echo "Seeded appcast from $SPARKLE_FEED_URL."
           else
-            rm -f source/appcast.xml
+            rm -f "source/${APPCAST_FILE}"
             echo "No existing appcast at $SPARKLE_FEED_URL; generating a fresh feed."
           fi
 
       - name: Generate signed appcast artifact
-        if: ${{ !inputs.smoke_test_only && steps.release_channel.outputs.is_beta != 'true' }}
+        if: ${{ !inputs.smoke_test_only }}
         working-directory: source
         env:
+          APPCAST_FILE: ${{ steps.release_channel.outputs.appcast_file }}
+          FEED_URL: ${{ steps.release_channel.outputs.feed_url }}
+          SPARKLE_APPCAST_PATH: ${{ steps.release_channel.outputs.appcast_file }}
           SPARKLE_DOWNLOAD_URL_PREFIX: https://github.com/openclaw/openclaw/releases/download/${{ inputs.tag }}/
           SPARKLE_RELEASE_VERSION: ${{ steps.package_version.outputs.value }}
-        run: scripts/make_appcast.sh "dist/OpenClaw-${{ steps.package_version.outputs.value }}.zip" "${{ env.SPARKLE_FEED_URL }}"
+        run: |
+          set -euo pipefail
+
+          # Older release tags write appcast.xml unconditionally. For beta
+          # recovery, seed that legacy path from appcast-beta.xml when present
+          # and remove any stable feed copy so beta generation cannot inherit
+          # stable Sparkle entries.
+          if [[ "${APPCAST_FILE}" != "appcast.xml" ]] && ! grep -Fq "SPARKLE_APPCAST_PATH" scripts/make_appcast.sh; then
+            if [[ -f "${APPCAST_FILE}" ]]; then
+              cp -f "${APPCAST_FILE}" appcast.xml
+            else
+              rm -f appcast.xml
+            fi
+            scripts/make_appcast.sh "dist/OpenClaw-${{ steps.package_version.outputs.value }}.zip" "${FEED_URL}"
+            cp -f appcast.xml "${APPCAST_FILE}"
+            exit 0
+          fi
+
+          scripts/make_appcast.sh "dist/OpenClaw-${{ steps.package_version.outputs.value }}.zip" "${FEED_URL}"
 
       - name: Resolve packaged artifact name
         id: packaged_artifacts
@@ -464,12 +493,14 @@ jobs:
 
       - name: Resolve appcast path
         id: appcast_path
-        if: ${{ !inputs.smoke_test_only && steps.release_channel.outputs.is_beta != 'true' }}
+        if: ${{ !inputs.smoke_test_only }}
+        env:
+          APPCAST_FILE: ${{ steps.release_channel.outputs.appcast_file }}
         run: |
           set -euo pipefail
-          APPCAST_PATH="source/appcast.xml"
+          APPCAST_PATH="source/${APPCAST_FILE}"
           if [[ -z "$APPCAST_PATH" || ! -f "$APPCAST_PATH" ]]; then
-            echo "Stable appcast artifact not found." >&2
+            echo "Signed appcast artifact not found: ${APPCAST_PATH}" >&2
             exit 1
           fi
           echo "path=$APPCAST_PATH" >> "$GITHUB_OUTPUT"
@@ -487,8 +518,8 @@ jobs:
           fi
           echo "value=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Upload stable appcast artifact
-        if: ${{ !inputs.smoke_test_only && steps.release_channel.outputs.is_beta != 'true' }}
+      - name: Upload signed appcast artifact
+        if: ${{ !inputs.smoke_test_only }}
         uses: actions/upload-artifact@v7
         with:
           name: macos-appcast-${{ inputs.tag }}
@@ -498,10 +529,6 @@ jobs:
       - name: Skip signed appcast for smoke tests
         if: ${{ inputs.smoke_test_only }}
         run: echo "Smoke-test mode enabled; skip shared production appcast artifact generation."
-
-      - name: Skip shared appcast for beta releases
-        if: ${{ !inputs.smoke_test_only && steps.release_channel.outputs.is_beta == 'true' }}
-        run: echo "Beta release detected; skip shared production appcast artifact generation."
 
       - name: Upload packaged macOS artifacts
         uses: actions/upload-artifact@v7
@@ -541,7 +568,7 @@ jobs:
             elif [[ "$IS_BETA" != "true" ]]; then
               echo "For stable releases, also download \`macos-appcast-${RELEASE_TAG}\` and commit \`appcast.xml\` back to \`main\` in \`${OPENCLAW_REPOSITORY}\`."
             else
-              echo "Beta release detected; no shared production \`appcast.xml\` artifact is generated."
+              echo "For beta releases, also download \`macos-appcast-${RELEASE_TAG}\` and commit \`appcast-beta.xml\` back to \`main\` in \`${OPENCLAW_REPOSITORY}\`."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -575,8 +602,12 @@ jobs:
           set -euo pipefail
           if [[ "$RELEASE_TAG" == *-beta.* ]]; then
             echo "is_beta=true" >> "$GITHUB_OUTPUT"
+            echo "feed_url=${SPARKLE_BETA_FEED_URL}" >> "$GITHUB_OUTPUT"
+            echo "appcast_file=appcast-beta.xml" >> "$GITHUB_OUTPUT"
           else
             echo "is_beta=false" >> "$GITHUB_OUTPUT"
+            echo "feed_url=${SPARKLE_STABLE_FEED_URL}" >> "$GITHUB_OUTPUT"
+            echo "appcast_file=appcast.xml" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Verify preflight run metadata
@@ -673,8 +704,7 @@ jobs:
             fi
           fi
 
-      - name: Download prepared stable appcast artifact
-        if: ${{ steps.release_channel.outputs.is_beta != 'true' }}
+      - name: Download prepared signed appcast artifact
         uses: actions/download-artifact@v8
         with:
           name: macos-appcast-${{ inputs.tag }}
@@ -743,12 +773,13 @@ jobs:
 
       - name: Resolve appcast path
         id: appcast_path
-        if: ${{ steps.release_channel.outputs.is_beta != 'true' }}
+        env:
+          APPCAST_FILE: ${{ steps.release_channel.outputs.appcast_file }}
         run: |
           set -euo pipefail
-          APPCAST_PATH="$(find promoted-appcast -type f -name 'appcast.xml' -print | sort | tail -n 1)"
+          APPCAST_PATH="$(find promoted-appcast -type f -name "${APPCAST_FILE}" -print | sort | tail -n 1)"
           if [[ -z "$APPCAST_PATH" || ! -f "$APPCAST_PATH" ]]; then
-            echo "Stable appcast artifact not found." >&2
+            echo "Signed appcast artifact not found: ${APPCAST_FILE}" >&2
             exit 1
           fi
           echo "path=$APPCAST_PATH" >> "$GITHUB_OUTPUT"
@@ -766,17 +797,12 @@ jobs:
           fi
           echo "value=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Upload stable appcast artifact
-        if: ${{ steps.release_channel.outputs.is_beta != 'true' }}
+      - name: Upload signed appcast artifact
         uses: actions/upload-artifact@v7
         with:
           name: macos-appcast-${{ inputs.tag }}
           path: ${{ steps.appcast_path.outputs.path }}
           if-no-files-found: error
-
-      - name: Skip shared appcast for beta releases
-        if: ${{ steps.release_channel.outputs.is_beta == 'true' }}
-        run: echo "Beta release detected; skip shared production appcast artifact generation."
 
       - name: Upload packaged macOS artifacts
         uses: actions/upload-artifact@v7
@@ -826,13 +852,14 @@ jobs:
             fi
           done
 
-      - name: Publish stable appcast to public main
-        if: ${{ steps.release_channel.outputs.is_beta != 'true' }}
+      - name: Publish signed appcast to public main
         env:
           GH_TOKEN: ${{ secrets.OPENCLAW_PUBLIC_REPO_RELEASE_TOKEN }}
           RELEASE_TAG: ${{ inputs.tag }}
           VERSION: ${{ steps.packaged_version.outputs.value }}
           APPCAST_PATH: ${{ steps.appcast_path.outputs.path }}
+          APPCAST_FILE: ${{ steps.release_channel.outputs.appcast_file }}
+          SPARKLE_FEED_URL: ${{ steps.release_channel.outputs.feed_url }}
         run: |
           set -euo pipefail
           if [[ -z "${GH_TOKEN:-}" ]]; then
@@ -840,43 +867,77 @@ jobs:
             exit 1
           fi
           if [[ -z "${APPCAST_PATH}" || ! -f "${APPCAST_PATH}" ]]; then
-            echo "Stable appcast path is missing: ${APPCAST_PATH}" >&2
+            echo "Signed appcast path is missing: ${APPCAST_PATH}" >&2
             exit 1
           fi
           appcast_source="$(realpath "${APPCAST_PATH}")"
 
           workdir="$(mktemp -d)"
           trap 'rm -rf "${workdir}"' EXIT
+
+          verify_public_appcast() {
+            local public_appcast
+            public_appcast="${workdir}/public-${APPCAST_FILE}"
+            for attempt in $(seq 1 12); do
+              if curl -fsSL "${SPARKLE_FEED_URL}?openclaw_release=${RELEASE_TAG#v}-${GITHUB_RUN_ID}-${attempt}" -o "${public_appcast}" &&
+                cmp -s "${appcast_source}" "${public_appcast}"; then
+                echo "Verified public ${APPCAST_FILE} is live for ${RELEASE_TAG}."
+                return 0
+              fi
+              sleep 10
+            done
+            echo "Public ${APPCAST_FILE} did not update to the signed appcast for ${RELEASE_TAG}." >&2
+            return 1
+          }
+
           git clone "https://x-access-token:${GH_TOKEN}@github.com/${OPENCLAW_REPOSITORY}.git" "${workdir}/openclaw"
           cd "${workdir}/openclaw"
           git config user.name "openclaw-release-bot"
           git config user.email "release-bot@openclaw.ai"
-          cp "${appcast_source}" appcast.xml
+          cp "${appcast_source}" "${APPCAST_FILE}"
 
-          if git diff --quiet -- appcast.xml; then
-            echo "Public main already has appcast.xml for ${RELEASE_TAG}."
+          if [[ -z "$(git status --porcelain -- "${APPCAST_FILE}")" ]]; then
+            echo "Public main already has ${APPCAST_FILE} for ${RELEASE_TAG}."
+            verify_public_appcast
             exit 0
           fi
 
-          git add appcast.xml
-          git commit -m "chore(release): update appcast for ${VERSION}"
+          git add "${APPCAST_FILE}"
+          git commit -m "chore(release): update ${APPCAST_FILE} for ${VERSION}"
           if git push origin HEAD:main; then
-            echo "Published appcast.xml directly to public main for ${RELEASE_TAG}."
+            echo "Published ${APPCAST_FILE} directly to public main for ${RELEASE_TAG}."
+            verify_public_appcast
             exit 0
           fi
 
           branch="release/appcast-${RELEASE_TAG#v}"
-          git push --force-with-lease origin HEAD:"${branch}"
+          remote_ref="refs/heads/${branch}"
+          tracking_ref="refs/remotes/origin/${branch}"
+          remote_appcast="${workdir}/remote-${APPCAST_FILE}"
+          if git ls-remote --exit-code --heads origin "${branch}" >/dev/null 2>&1; then
+            git fetch origin "+${remote_ref}:${tracking_ref}"
+            if git show "${tracking_ref}:${APPCAST_FILE}" > "${remote_appcast}" 2>/dev/null &&
+              cmp -s "${remote_appcast}" "${appcast_source}"; then
+              echo "Fallback branch already has ${APPCAST_FILE} for ${RELEASE_TAG}."
+            else
+              expected_oid="$(git rev-parse "${tracking_ref}")"
+              git push "--force-with-lease=${remote_ref}:${expected_oid}" origin HEAD:"${branch}"
+            fi
+          else
+            git push "--force-with-lease=${remote_ref}:" origin HEAD:"${branch}"
+          fi
           pr_url="$(gh pr list --repo "${OPENCLAW_REPOSITORY}" --head "${branch}" --state open --json url --jq '.[0].url // empty')"
           if [[ -z "${pr_url}" ]]; then
             pr_url="$(gh pr create \
               --repo "${OPENCLAW_REPOSITORY}" \
               --head "${branch}" \
               --base main \
-              --title "chore(release): update appcast for ${VERSION}" \
-              --body "Updates the stable Sparkle appcast generated by macOS publish for ${RELEASE_TAG}.")"
+              --title "chore(release): update ${APPCAST_FILE} for ${VERSION}" \
+              --body "Updates the signed Sparkle appcast generated by macOS publish for ${RELEASE_TAG}.")"
           fi
-          echo "Direct main push was blocked; opened appcast PR: ${pr_url}"
+          echo "Direct main push was blocked; opened appcast PR: ${pr_url}" >&2
+          echo "Public ${APPCAST_FILE} is not live until that PR merges; failing this publish run so desktop distribution is not reported as complete." >&2
+          exit 1
 
       - name: Summarize follow-up
         env:
@@ -895,9 +956,5 @@ jobs:
             echo
             echo "This real publish reused preflight artifacts from run \`${PREFLIGHT_RUN_ID}\`; no rebuild, signing, or notarization work ran in this publish job."
             echo
-            if [[ "$IS_BETA" != "true" ]]; then
-              echo "Stable appcast publish runs automatically after public release assets are verified. If direct \`main\` push is blocked, the workflow opens or updates an appcast PR."
-            else
-              echo "Beta release detected; no shared production \`appcast.xml\` artifact is generated."
-            fi
+            echo "Signed appcast publish runs automatically after public release assets are verified. If direct \`main\` push is blocked, the workflow opens or updates an appcast PR."
           } >> "$GITHUB_STEP_SUMMARY"
