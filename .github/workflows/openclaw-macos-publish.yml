@@ -39,6 +39,11 @@ on:
         required: false
         default: main
         type: string
+      replace_assets:
+        description: Allow replacing existing public macOS release assets during explicit recovery
+        required: true
+        default: false
+        type: boolean
 
 concurrency:
   group: openclaw-macos-publish-${{ contains(inputs.tag, '-beta.') && 'beta-feed' || 'stable-feed' }}
@@ -518,6 +523,69 @@ jobs:
           fi
           echo "value=$VERSION" >> "$GITHUB_OUTPUT"
 
+      - name: Validate signed appcast artifact
+        if: ${{ !inputs.smoke_test_only }}
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          VERSION: ${{ steps.packaged_version.outputs.value }}
+          APPCAST_PATH: ${{ steps.appcast_path.outputs.path }}
+          APPCAST_FILE: ${{ steps.release_channel.outputs.appcast_file }}
+          IS_BETA: ${{ steps.release_channel.outputs.is_beta }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import sys
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          sparkle = "{http://www.andymatuschak.org/xml-namespaces/sparkle}"
+          tag = os.environ["RELEASE_TAG"]
+          version = os.environ["VERSION"]
+          appcast_file = os.environ["APPCAST_FILE"]
+          is_beta = os.environ["IS_BETA"] == "true"
+          expected_file = "appcast-beta.xml" if is_beta else "appcast.xml"
+          expected_url = f"https://github.com/openclaw/openclaw/releases/download/{tag}/OpenClaw-{version}.zip"
+          path = Path(os.environ["APPCAST_PATH"])
+
+          if appcast_file != expected_file:
+              sys.exit(f"Unexpected appcast file for channel: expected {expected_file}, got {appcast_file}")
+          if is_beta and "-beta." not in tag:
+              sys.exit(f"Beta appcast selected for non-beta tag: {tag}")
+          if not is_beta and "-beta." in tag:
+              sys.exit(f"Stable appcast selected for beta tag: {tag}")
+          if path.name != appcast_file:
+              sys.exit(f"Appcast artifact path {path} does not end with {appcast_file}")
+
+          root = ET.parse(path).getroot()
+          channel = root.find("channel")
+          items = channel.findall("item") if channel is not None else []
+          matches = []
+          for item in items:
+              enclosure = item.find("enclosure")
+              if enclosure is None:
+                  continue
+              if enclosure.get("url") == expected_url or item.findtext(f"{sparkle}shortVersionString") == version:
+                  matches.append((item, enclosure))
+          if not matches:
+              sys.exit(f"No appcast item found for {version} at {expected_url}")
+          item, enclosure = matches[0]
+          actual_version = item.findtext(f"{sparkle}shortVersionString")
+          if actual_version != version:
+              sys.exit(f"Appcast version mismatch: expected {version}, got {actual_version}")
+          if enclosure.get("url") != expected_url:
+              sys.exit(f"Appcast enclosure URL mismatch: expected {expected_url}, got {enclosure.get('url')}")
+          if not enclosure.get(f"{sparkle}edSignature"):
+              sys.exit("Appcast enclosure is missing sparkle:edSignature")
+          length = enclosure.get("length")
+          if not length or not length.isdigit() or int(length) <= 0:
+              sys.exit(f"Appcast enclosure length is invalid: {length}")
+          content_type = enclosure.get("type")
+          if content_type not in {"application/octet-stream", "application/zip", "application/x-zip-compressed"}:
+              sys.exit(f"Appcast enclosure type is unexpected: {content_type}")
+          print(f"Validated {appcast_file} item for {version}: {expected_url}")
+          PY
+
       - name: Upload signed appcast artifact
         if: ${{ !inputs.smoke_test_only }}
         uses: actions/upload-artifact@v7
@@ -565,10 +633,9 @@ jobs:
             echo
             if [[ "$SMOKE_TEST_ONLY" == "true" ]]; then
               echo "Smoke-test mode skips shared production \`appcast.xml\` generation."
-            elif [[ "$IS_BETA" != "true" ]]; then
-              echo "For stable releases, also download \`macos-appcast-${RELEASE_TAG}\` and commit \`appcast.xml\` back to \`main\` in \`${OPENCLAW_REPOSITORY}\`."
             else
-              echo "For beta releases, also download \`macos-appcast-${RELEASE_TAG}\` and commit \`appcast-beta.xml\` back to \`main\` in \`${OPENCLAW_REPOSITORY}\`."
+              echo "The signed appcast artifact has been generated and semantically validated for this channel."
+              echo "Run real publish from \`main\` with this preflight run id after mac validation succeeds; real publish uploads release assets first and then publishes the matching signed appcast."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -797,6 +864,68 @@ jobs:
           fi
           echo "value=$VERSION" >> "$GITHUB_OUTPUT"
 
+      - name: Validate signed appcast artifact
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          VERSION: ${{ steps.packaged_version.outputs.value }}
+          APPCAST_PATH: ${{ steps.appcast_path.outputs.path }}
+          APPCAST_FILE: ${{ steps.release_channel.outputs.appcast_file }}
+          IS_BETA: ${{ steps.release_channel.outputs.is_beta }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import sys
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          sparkle = "{http://www.andymatuschak.org/xml-namespaces/sparkle}"
+          tag = os.environ["RELEASE_TAG"]
+          version = os.environ["VERSION"]
+          appcast_file = os.environ["APPCAST_FILE"]
+          is_beta = os.environ["IS_BETA"] == "true"
+          expected_file = "appcast-beta.xml" if is_beta else "appcast.xml"
+          expected_url = f"https://github.com/openclaw/openclaw/releases/download/{tag}/OpenClaw-{version}.zip"
+          path = Path(os.environ["APPCAST_PATH"])
+
+          if appcast_file != expected_file:
+              sys.exit(f"Unexpected appcast file for channel: expected {expected_file}, got {appcast_file}")
+          if is_beta and "-beta." not in tag:
+              sys.exit(f"Beta appcast selected for non-beta tag: {tag}")
+          if not is_beta and "-beta." in tag:
+              sys.exit(f"Stable appcast selected for beta tag: {tag}")
+          if path.name != appcast_file:
+              sys.exit(f"Appcast artifact path {path} does not end with {appcast_file}")
+
+          root = ET.parse(path).getroot()
+          channel = root.find("channel")
+          items = channel.findall("item") if channel is not None else []
+          matches = []
+          for item in items:
+              enclosure = item.find("enclosure")
+              if enclosure is None:
+                  continue
+              if enclosure.get("url") == expected_url or item.findtext(f"{sparkle}shortVersionString") == version:
+                  matches.append((item, enclosure))
+          if not matches:
+              sys.exit(f"No appcast item found for {version} at {expected_url}")
+          item, enclosure = matches[0]
+          actual_version = item.findtext(f"{sparkle}shortVersionString")
+          if actual_version != version:
+              sys.exit(f"Appcast version mismatch: expected {version}, got {actual_version}")
+          if enclosure.get("url") != expected_url:
+              sys.exit(f"Appcast enclosure URL mismatch: expected {expected_url}, got {enclosure.get('url')}")
+          if not enclosure.get(f"{sparkle}edSignature"):
+              sys.exit("Appcast enclosure is missing sparkle:edSignature")
+          length = enclosure.get("length")
+          if not length or not length.isdigit() or int(length) <= 0:
+              sys.exit(f"Appcast enclosure length is invalid: {length}")
+          content_type = enclosure.get("type")
+          if content_type not in {"application/octet-stream", "application/zip", "application/x-zip-compressed"}:
+              sys.exit(f"Appcast enclosure type is unexpected: {content_type}")
+          print(f"Validated {appcast_file} item for {version}: {expected_url}")
+          PY
+
       - name: Upload signed appcast artifact
         uses: actions/upload-artifact@v7
         with:
@@ -821,18 +950,31 @@ jobs:
           ZIP_PATH: ${{ steps.packaged_files.outputs.zip }}
           DMG_PATH: ${{ steps.packaged_files.outputs.dmg }}
           DSYM_PATH: ${{ steps.packaged_files.outputs.dsym }}
+          REPLACE_ASSETS: ${{ inputs.replace_assets }}
         run: |
           set -euo pipefail
           if [[ -z "${GH_TOKEN:-}" ]]; then
             echo "Missing OPENCLAW_PUBLIC_REPO_RELEASE_TOKEN secret." >&2
             exit 1
           fi
-          gh release upload "$RELEASE_TAG" \
-            "$ZIP_PATH" \
-            "$DMG_PATH" \
-            "$DSYM_PATH" \
-            --clobber \
-            --repo "$OPENCLAW_REPOSITORY"
+          existing_names="$(gh release view "$RELEASE_TAG" --repo "$OPENCLAW_REPOSITORY" --json assets --jq '.assets[].name')"
+          conflicts=()
+          for asset_path in "$ZIP_PATH" "$DMG_PATH" "$DSYM_PATH"; do
+            asset_name="$(basename "$asset_path")"
+            if printf '%s\n' "$existing_names" | grep -Fqx "$asset_name"; then
+              conflicts+=("$asset_name")
+            fi
+          done
+          if (( ${#conflicts[@]} > 0 )) && [[ "$REPLACE_ASSETS" != "true" ]]; then
+            printf 'Public release already has macOS asset(s): %s\n' "${conflicts[*]}" >&2
+            echo "Set replace_assets=true only for an explicit recovery rerun after verifying the preflight artifact digest." >&2
+            exit 1
+          fi
+          upload_args=(gh release upload "$RELEASE_TAG" "$ZIP_PATH" "$DMG_PATH" "$DSYM_PATH" --repo "$OPENCLAW_REPOSITORY")
+          if [[ "$REPLACE_ASSETS" == "true" ]]; then
+            upload_args+=(--clobber)
+          fi
+          "${upload_args[@]}"
 
       - name: Verify public GitHub release assets
         env:
